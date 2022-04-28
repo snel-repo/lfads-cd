@@ -2,23 +2,28 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 import tensorflow as tf
+from tensorflow_probability import distributions as tfd
 import numpy as np
 import sys
 import time
 import os
+os.environ['TF_CPP_MIN_LOG_LEVEL']='3'
+tf.compat.v1.logging.set_verbosity(tf.compat.v1.logging.ERROR)
 import re
+import pdb
+import random
 #import matplotlib.pyplot as plt
 
 
 # utils defined by CP/MRK
 from helper_funcs import linear, init_linear_transform, makeInitialState
-from helper_funcs import ListOfRandomBatches, kind_dict, kind_dict_key
+from helper_funcs import ListOfRandomBatches, kind_dict, kind_dict_key, shuffle_spikes_in_time
 from helper_funcs import LearnableAutoRegressive1Prior
 from helper_funcs import DiagonalGaussianFromExisting, LearnableDiagonalGaussian, diag_gaussian_log_likelihood
-from helper_funcs import LinearTimeVarying
+from helper_funcs import LinearTimeVarying, FeedforwardTimeVarying, zeroInflatedGamma
 from helper_funcs import KLCost_GaussianGaussian, KLCost_GaussianGaussianProcessSampled
 from data_funcs import write_data
-from helper_funcs import printer, mkdir_p, write_code_commit
+from helper_funcs import printer, mkdir_p
 #from plot_funcs import plot_data, close_all_plots
 #from data_funcs import read_datasets
 from customcells import ComplexCell
@@ -72,6 +77,7 @@ class LFADS(object):
         #CELL_TYPE = 'lstm' # not working
         #CELL_TYPE = 'gru'
         CELL_TYPE = 'customgru'
+        print('This is a REDUCE_MEAN lfadslite.')
 
         # to stop certain gradients paths through the graph in backprop
         def entry_stop_gradients(target, mask):
@@ -80,13 +86,6 @@ class LFADS(object):
 
         # save the stdout to a log file and prints it on the screen
         mkdir_p(hps['lfads_save_dir'])
-        latest_commit = write_code_commit(hps.lfads_save_dir)
-        print('==================== Code Version: ')
-        print('This is a REDUCE_MEAN lfadslite. Commit:')
-        print(latest_commit)
-        print('================================== ')
-
-
         #sys.stdout = Logger(os.path.join(hps['lfads_save_dir'], "lfads_output.log"))
         logger = Logger(os.path.join(hps['lfads_save_dir'], "lfads_output.log"))
         self.printlog = logger.printlog
@@ -116,8 +115,9 @@ class LFADS(object):
             # dropout keep probability
             #   enumerated in helper_funcs.kind_dict
             self.keep_prob = tf.placeholder(tf.float32, name='keep_prob')
+            self.ff_keep_prob = tf.placeholder(tf.float32, name='ff_keep_prob')
             self.keep_ratio = tf.placeholder(tf.float32, name='keep_ratio')
-            self.cv_keep_ratio = tf.placeholder(tf.float32, name='cv_keep_ratio')
+            self.gamma_prior = tf.placeholder(tf.float32, name='gamma_prior')
 
             self.run_type = tf.placeholder(tf.int32, name='run_type')
             self.kl_ic_weight = tf.placeholder(tf.float32, name='kl_ic_weight')
@@ -156,6 +156,7 @@ class LFADS(object):
         #allsets = hps['dataset_dims'].keys()
         #self.input_dim = hps['dataset_dims'][allsets[0]]
         
+        self.cv_keep_ratio = hps['cv_keep_ratio']
         self.cd_grad_passthru_prob = hps['cd_grad_passthru_prob']
 
         ## do per-session stuff
@@ -225,7 +226,7 @@ class LFADS(object):
                     out_mat_fxc = in_mat_cxf.T
             if align_bias_1xc is not None:
                 out_bias_1xc = align_bias_1xc
-            
+                
             if hps.output_dist.lower() == 'poisson':
                 output_size = data_dim
             elif hps.output_dist.lower() == 'gaussian':
@@ -234,12 +235,30 @@ class LFADS(object):
                     out_mat_fxc = tf.concat( [ out_mat_fxc, out_mat_fxc ], 0 )
                 if out_bias_1xc is not None:
                     out_bias_1xc = tf.concat( [ out_bias_1xc, out_bias_1xc ], 0 )
+            elif hps.output_dist.lower() == 'log-normal':
+                output_size = data_dim * 2
+                if out_mat_fxc is not None:
+                    out_mat_fxc = tf.concat( [ out_mat_fxc, out_mat_fxc ], 0 )
+                if out_bias_1xc is not None:
+                    out_bias_1xc = tf.concat( [ out_bias_1xc, out_bias_1xc ], 0 )               
             elif hps.output_dist.lower() == 'inverse-gamma':
                 output_size = data_dim * 2
                 if out_mat_fxc is not None:
                     out_mat_fxc = tf.concat( [ out_mat_fxc, out_mat_fxc ], 0 )
                 if out_bias_1xc is not None:
                     out_bias_1xc = tf.concat( [ out_bias_1xc, out_bias_1xc ], 0 )
+            elif hps.output_dist.lower() == 'gamma':
+                output_size = data_dim * 2
+                if out_mat_fxc is not None:
+                    out_mat_fxc = tf.concat( [ out_mat_fxc, out_mat_fxc ], 0 )
+                if out_bias_1xc is not None:
+                    out_bias_1xc = tf.concat( [ out_bias_1xc, out_bias_1xc ], 0 )
+            elif hps.output_dist.lower() == 'zi-gamma':
+                output_size = data_dim * 3
+                if out_mat_fxc is not None:
+                    out_mat_fxc = tf.concat( [ out_mat_fxc, out_mat_fxc, out_mat_fxc ], 0 )
+                if out_bias_1xc is not None:
+                    out_bias_1xc = tf.concat( [ out_bias_1xc, out_bias_1xc, out_bias_1xc ], 0 )
                     
             out_fac_linear = init_linear_transform( hps.factors_dim, output_size, mat_init_value=out_mat_fxc,
                                                    bias_init_value=out_bias_1xc,
@@ -264,14 +283,37 @@ class LFADS(object):
         this_dataset_out_fac_b = _case_with_no_default( pf_pairs_out_fac_bs )
         this_dataset_dims = _case_with_no_default( pf_pairs_this_dataset_dims )
                 
-
         graph_batch_size = tf.shape(self.dataset_ph)[0]
 
         # apply dropout to the data
         self.dataset_in_orig = self.dataset_ph * \
                           tf.expand_dims(tf.ones([graph_batch_size, 1]), 1) * this_dataset_dims
+        self.mask_notNaN = tf.logical_not( tf.is_nan(self.dataset_in_orig) )
+        self.dataset_in_orig = tf.where(tf.is_nan(self.dataset_in_orig), tf.zeros_like(self.dataset_in_orig), self.dataset_in_orig)
+        
+        # apply temporal shift operation to data if necessary
+        if hps.temporal_shift > 0:
+            hps = self.apply_temporal_shift( hps, kind_dict )
+            # batch_size - read from the data placeholder
+            #self.dataset_in = tf.nn.dropout(self.dataset_in, self.keep_prob)
+        else:
+            # batch_size - read from the data placeholder
+            #self.dataset_in = tf.nn.dropout(self.dataset_in, self.keep_prob)
+            self.dataset_in = self.dataset_in_orig
+
+        # log transform input if necessary
+        #if hps.log_transform_input is True:
+            #self.printlog( "APPLYING LOG TRANSFORM")
+            #self.dataset_in = tf.math.log(self.dataset_in)
+        self.dataset_in = tf.cond( tf.equal( tf.constant(hps.log_transform_input), tf.constant(True) ), lambda: tf.math.log(self.dataset_in), lambda: self.dataset_in )
+
+        # apply dropout
         # batch_size - read from the data placeholder
-        self.dataset_in = tf.nn.dropout(self.dataset_in_orig, self.keep_prob)
+        self.dataset_in = tf.nn.dropout(self.dataset_in, self.keep_prob)
+
+        # for debugging
+        #self.print_op = tf.print(self.dataset_in, output_stream=sys.stdout)
+            
         # can we infer the data dimensionality for the random mask?
         full_seq_len = hps.num_steps
         if hps.ic_enc_seg_len > 0:
@@ -287,44 +329,35 @@ class LFADS(object):
         if hps.keep_ratio != 1.0:
             # coordinated dropout enabled on inputs
             # don't apply CD on ic_enc_segment
+            print( 'APPLYING COORDINATED DROPOUT' )
             masked_dataset_in, coor_drop_binary_mask = dropout(self.dataset_in, self.keep_ratio)
         else:
             # no coordinated dropout
+            print( 'NOT APPLYING COORDINATED DROPOUT' )
             masked_dataset_in = self.dataset_in
 
         # replicate the cross-validation binary mask for this dataset for all elements of the batch
         # work around error in dynamic rnn when input dim is None
         # don't apply CV mask to ic_enc_segment
-
-        # define the SV noise type
-        sv_mask_type = 'zeros'
-        if hps.cv_keep_ratio < 1.0:
-            self.cv_rand_mask = self.cv_rand_mask_ph[:, hps.ic_enc_seg_len:, :]
-            self.cv_binary_mask_batch = self.cv_rand_mask * \
-                                        tf.expand_dims(tf.ones([graph_batch_size, 1]), 1) * \
-                                        this_dataset_dims[hps.ic_enc_seg_len:, :]
-
-            # MRK: apply cross-validation dropout
-            if sv_mask_type == 'zeros':
-                masked_dataset_in = tf.div(masked_dataset_in, self.cv_keep_ratio) * self.cv_binary_mask_batch
-                masked_dataset_in.set_shape(self.cv_binary_mask_batch.get_shape())
-
-            elif sv_mask_type == 'shuffle':
-                # change the cv dropout to randomly sample from empirical distribution
-                masked_dataset_in = masked_dataset_in * self.cv_binary_mask_batch + (1. -  self.cv_binary_mask_batch) * \
+        self.cv_rand_mask = self.cv_rand_mask_ph[:, hps.ic_enc_seg_len:, :]
+        self.cv_binary_mask_batch = self.cv_rand_mask * \
+                                    tf.expand_dims(tf.ones([graph_batch_size, 1]), 1) * \
+                                    this_dataset_dims[hps.ic_enc_seg_len:, :]
+                                    
+        # LW: if we apply temporal shift, we need to adjust the sample validation mask to trim the edges
+        if hps.temporal_shift > 0:
+            self.cv_binary_mask_batch = self.cv_binary_mask_batch[:,hps.temporal_shift:-hps.temporal_shift,:]
+            
+        # MRK: apply cross-validation dropout
+        # change the cv dropout to randomly sample from empirical distribution
+        masked_dataset_in = masked_dataset_in * self.cv_binary_mask_batch + (1. -  self.cv_binary_mask_batch) * \
+                            tf.transpose(
+                                tf.random.shuffle(
                                     tf.transpose(
-                                        tf.random.shuffle(
-                                            tf.transpose(
-                                                tf.random.shuffle(self.dataset_in), [1, 0, 2]
-                                            )
-                                        ),
-                                        [1, 0, 2])
-        else:
-            self.cv_rand_mask = tf.ones_like(self.cv_rand_mask_ph[:, hps.ic_enc_seg_len:, :])
-            self.cv_binary_mask_batch = self.cv_rand_mask * \
-                                        tf.expand_dims(tf.ones([graph_batch_size, 1]), 1) * \
-                                        this_dataset_dims[hps.ic_enc_seg_len:, :]
-
+                                        tf.random.shuffle(self.dataset_in), [1, 0, 2]
+                                    )
+                                ),
+                                [1, 0, 2])
 
         # MRK: if hps.ic_enc_seg_len is 0, switch to non-causal mode
         if hps.ic_enc_seg_len > 0:
@@ -335,6 +368,14 @@ class LFADS(object):
             seq_len = hps.num_steps
             ic_enc_seg_len = 0
             self.input_to_ci_encoder = masked_dataset_in
+
+        #masked_dataset_in = tf.div(masked_dataset_in, self.cv_keep_ratio) * self.cv_binary_mask_batch
+
+        # add noise insteaad of zeroing the held-out samples
+        #masked_noise = (1. - self.cv_binary_mask_batch) * tf.transpose(
+        #    tf.random_shuffle(tf.transpose(tf.random_shuffle(self.dataset_in), perm=[1,0,2])),
+        #    perm=[1,0,2])
+        # masked_dataset_in = masked_dataset_in * self.cv_binary_mask_batch #+ masked_noise
 
         # define input to encoders
         if hps.in_factors_dim > 0:
@@ -449,6 +490,11 @@ class LFADS(object):
         if hps.co_dim > 0:
             print('Controller is used.')
             with tf.variable_scope('ci_enc'):
+
+                #ci_enc_cell = CustomGRUCell(num_units = hps['ci_enc_dim'],\
+                #                            batch_size = graph_batch_size,
+                #                            clip_value = hps['cell_clip_value'],
+                #                            recurrent_collections=['l2_ci_enc'])
                 ## ci_encoder
                 self.ci_enc_rnn_obj = BidirectionalDynamicRNN(
                     state_dim = hps['ci_enc_dim'],
@@ -520,6 +566,8 @@ class LFADS(object):
                                        hps['co_dim'], # for the sampled controller output
                                        hps['factors_dim']]
 
+                # construct the actual RNN
+                #   its inputs are the output of the controller_input_enc
 
             # construct the complexcell
             self.complexcell=ComplexCell(num_units_gen=hps['gen_dim'],
@@ -570,17 +618,102 @@ class LFADS(object):
                 nonlin = 'exp'
             elif hps.output_dist.lower() == 'gaussian':
                 nonlin = None
+            elif hps.output_dist.lower() == 'log-normal':
+                nonlin= None
+            elif hps.output_dist.lower() == 'inverse-gamma':
+                if hps.fac_2_rates_transform.lower() == 'linexp':
+                    nonlin = 'exp'
+                else:
+                    nonlin = None
+            elif hps.output_dist.lower() == 'gamma':
+                if hps.fac_2_rates_transform.lower() == 'linexp':
+                    nonlin = 'exp'
+                elif hps.fac_2_rates_transform.lower() == 'linscaledsigmoid':
+                    nonlin = 'scaled_sigmoid'
+                else:
+                    nonlin = None
+            elif hps.output_dist.lower() == 'zi-gamma':
+                if hps.fac_2_rates_transform.lower() == 'linexp':
+                    nonlin = 'exp'
+                elif hps.fac_2_rates_transform.lower() == 'linscaledsigmoid':
+                    nonlin = 'scaled_sigmoid'
+                else:
+                    nonlin = None
+            elif hps.output_dist.lower() == 'inverse-gaussian':
+                if hps.fac_2_rates_transform.lower() == 'linexp':
+                    nonlin = 'exp'
+                else:
+                    nonlin = None
             else:
                 raise NameError("Unknown output distribution: " + hps.output_dist)
                 
             # rates are taken as a linear (or nonlinear) readout from the factors
             self.factors.set_shape([None, seq_len, hps['factors_dim']])
-            rates_object = LinearTimeVarying(inputs = self.factors,
-                                             output_size = output_size,
-                                             transform_name = 'factors_2_rates',
-                                             W = this_dataset_out_fac_W,
-                                             b = this_dataset_out_fac_b,
-                                             nonlinearity = nonlin)
+            if hps.output_dist.lower() == 'inverse-gamma' or hps.output_dist.lower() == 'gamma' or hps.output_dist.lower() == 'inverse-gaussian':
+                if hps.fac_2_rates_transform.lower() == 'linexp':
+                    print( 'Using LinearTimeVarying for output from factors 2 rates' )
+                    rates_object = LinearTimeVarying(inputs = self.factors,
+                                                     output_size = output_size,
+                                                     transform_name = 'factors_2_rates',
+                                                     W = this_dataset_out_fac_W,
+                                                     b = this_dataset_out_fac_b,
+                                                     nonlinearity = nonlin)
+                elif hps.fac_2_rates_transform.lower() == 'linscaledsigmoid':
+                    print( 'Using LinearTimeVarying linscaledsigmoid for output from factors 2 rates' )
+                    rates_object = LinearTimeVarying(inputs = self.factors,
+                                                     output_size = output_size,
+                                                     transform_name = 'factors_2_rates',
+                                                     W = this_dataset_out_fac_W,
+                                                     b = this_dataset_out_fac_b,
+                                                     nonlinearity = nonlin,
+                                                     scaled_sigmoid_collection='l2_scaled_sigmoid')
+                elif hps.fac_2_rates_transform.lower() == 'feedforward':
+                    # fully connected layer from inputs (factors) to outputs (alpha/beta)
+                    print('Using FeedTimeVarying for output from factors 2 rates')
+                    rates_object = FeedforwardTimeVarying(inputs= self.factors,
+                                                          output_size= output_size,
+                                                          collections= 'l2_fac_2_rates',
+                                                          output_name= 'rates_concat',
+                                                          keep_prob= self.ff_keep_prob)
+                else:
+                    raise NameError("Unknown fac_2_rates_transform option: " + hps.fac_2_rates_transform)
+            elif hps.output_dist.lower() == 'zi-gamma':
+                if hps.fac_2_rates_transform.lower() == 'linexp':
+                    print( 'Using LinearTimeVarying for output from factors 2 rates' )
+                    rates_object = LinearTimeVarying(inputs = self.factors,
+                                                     output_size = output_size,
+                                                     transform_name = 'factors_2_rates',
+                                                     W = this_dataset_out_fac_W,
+                                                     b = this_dataset_out_fac_b,
+                                                     nonlinearity = nonlin,
+                                                     zigamma = True)
+                elif hps.fac_2_rates_transform.lower() == 'linscaledsigmoid':
+                    print( 'Using LinearTimeVarying linscaledsigmoid for output from factors 2 rates' )
+                    rates_object = LinearTimeVarying(inputs = self.factors,
+                                                     output_size = output_size,
+                                                     transform_name = 'factors_2_rates',
+                                                     W = this_dataset_out_fac_W,
+                                                     b = this_dataset_out_fac_b,
+                                                     nonlinearity = nonlin,
+                                                     scaled_sigmoid_collection='l2_scaled_sigmoid',
+                                                     zigamma = True)
+                elif hps.fac_2_rates_transform.lower() == 'feedforward':
+                    # fully connected layer from inputs (factors) to outputs (alpha/beta)
+                    print('Using FeedTimeVarying for output from factors 2 rates')
+                    rates_object = FeedforwardTimeVarying(inputs= self.factors,
+                                                          output_size= output_size,
+                                                          collections= 'l2_fac_2_rates',
+                                                          output_name= 'rates_concat',
+                                                          keep_prob= self.ff_keep_prob,
+                                                          zigamma = True)
+            else:
+                # rates are taken as a linear (or nonlinear) readout from the factors
+                rates_object = LinearTimeVarying(inputs = self.factors,
+                                                 output_size = output_size,
+                                                 transform_name = 'factors_2_rates',
+                                                 W = this_dataset_out_fac_W,
+                                                 b = this_dataset_out_fac_b,
+                                                 nonlinearity = nonlin)
 
             # select the relevant part of the output depending on model type
             if hps.output_dist.lower() == 'poisson':
@@ -592,7 +725,55 @@ class LFADS(object):
                 self.output_mean, self.output_logvar = tf.split(rates_object.output,
                                                                 2, axis=2)
                 self.output_dist_params=rates_object.output
-
+                
+            elif hps.output_dist.lower() == 'log-normal':
+                # get linear outputs, split into mean and variance
+                self.output_logmean, self.output_logvar = tf.split(rates_object.output,
+                                                                2, axis=2)
+                self.output_rates = tfd.LogNormal( self.output_logmean, self.output_logvar ).mean()
+                self.output_dist_params=rates_object.output
+            elif hps.output_dist.lower() == 'inverse-gamma':
+                if hps.fac_2_rates_transform.lower() == 'linexp':
+                    self.alpha, self.beta = tf.split( rates_object.output_nl, 2, axis=2 )
+                else:
+                    self.alpha, self.beta = tf.split( rates_object.output, 2, axis=2 )
+                # offset alpha to keep in allowed range
+                self.alpha += 1
+                self.output_rates = tfd.InverseGamma( self.alpha, self.beta ).mean()
+                #self.output_dist_params=rates_object.output_nl
+                self.output_dist_params= tf.concat( [ self.alpha, self.beta ], axis=2 );
+            elif hps.output_dist.lower() == 'gamma':
+                if hps.fac_2_rates_transform.lower() == 'linexp':
+                    self.alpha, self.beta = tf.split( rates_object.output_nl, 2, axis=2 )
+                elif hps.fac_2_rates_transform.lower() == 'linscaledsigmoid':
+                    self.alpha, self.scale = tf.split( rates_object.output_nl, 2, axis=2 )
+                    self.beta = tf.divide(1.0, self.scale)
+                else:
+                    self.alpha, self.beta = tf.split( rates_object.output, 2, axis=2 )
+                self.output_rates = tfd.Gamma( self.alpha, self.beta ).mean()
+                #self.output_dist_params=rates_object.output_nl
+                self.output_dist_params= tf.concat( [ self.alpha, self.beta ], axis=2 );
+            elif hps.output_dist.lower() == 'zi-gamma':
+                if hps.fac_2_rates_transform.lower() == 'linexp':
+                    self.alpha, self.beta, self.q = tf.split( rates_object.output_nl, 3, axis=2 )
+                    self.output_dist_params= tf.concat( [ self.alpha, self.beta, self.q ], axis=2 );
+                if hps.fac_2_rates_transform.lower() == 'linscaledsigmoid':
+                    self.alpha, self.scale, self.q = tf.split( rates_object.output_nl, 3, axis=2 )
+                    self.beta = tf.divide(1.0, self.scale)
+                    self.output_dist_params= tf.concat( [ self.alpha, self.scale, self.q ], axis=2 )
+                else:
+                    self.alpha, self.beta, self.q = tf.split( rates_object.output, 3, axis=2 )
+                    self.output_dist_params= tf.concat( [ self.alpha, self.beta, self.q ], axis=2 );
+                self.output_rates = tf.math.multiply(self.q, tfd.Gamma( self.alpha, self.beta ).mean())
+                #self.output_dist_params=rates_object.output_nl
+            elif hps.output_dist.lower() == 'inverse-gaussian':
+                if hps.fac_2_rates_transform.lower() == 'linexp':
+                    self.output_loc, self.output_conc = tf.split( rates_object.output_nl, 2, axis=2 )
+                else:
+                    self.output_loc, self.output_conc = tf.split( rates_object.output, 2, axis=2 )
+                    
+                self.output_rates = tfd.InverseGaussian( self.output_loc, self.output_conc ).mean()
+                self.output_dist_params= tf.concat( [ self.output_loc, self.output_conc ], axis=2 );
 
         ## calculate the KL cost
         # g0 - build a prior distribution to compare to
@@ -616,6 +797,15 @@ class LFADS(object):
             # if there are controller outputs, calculate a KL cost for them
             # first build a prior to compare to
             # Controller outputs
+            #autocorrelation_taus = [hps.prior_ar_atau for x in range(hps.co_dim)]
+            #noise_variances = [hps.prior_ar_nvar for x in range(hps.co_dim)]
+            #self.cos_prior = prior_zs_ar_con = \
+            #    LearnableAutoRegressive1Prior(graph_batch_size, hps.co_dim,
+            #                                  autocorrelation_taus,
+            #                                  noise_variances,
+            #                                  hps.do_train_prior_ar_atau,
+            #                                  hps.do_train_prior_ar_nvar,
+            #                                  hps['num_steps'], "u_prior_ar1")
 
             # posterior on controller output
             self.cos_posterior = DiagonalGaussianFromExisting(
@@ -673,6 +863,8 @@ class LFADS(object):
             grad_binary_mask = self.cv_binary_mask_batch
 
         # block gradients for coordinated dropout and cross-validation
+        grad_binary_mask = tf.multiply(tf.cast(self.mask_notNaN, tf.float32), grad_binary_mask, name= None)
+
         if hps.output_dist.lower() == 'poisson':
             # stop the gradient where grad_binary_mask is zero
             masked_logrates = entry_stop_gradients(self.logrates, grad_binary_mask)
@@ -682,13 +874,42 @@ class LFADS(object):
             masked_output_logvar = entry_stop_gradients(self.output_logvar, grad_binary_mask)
             self.loglikelihood_b_t = diag_gaussian_log_likelihood(self.dataset_in_orig,
                                                                   masked_output_mean, masked_output_logvar)
+        elif hps.output_dist.lower() == 'log-normal':
+            masked_output_logmean = entry_stop_gradients(self.output_logmean, grad_binary_mask)
+            masked_output_logvar = entry_stop_gradients(self.output_logvar, grad_binary_mask)
+            self.loglikelihood_b_t = tfd.LogNormal( masked_output_logmean, masked_output_logvar ).log_prob( self.dataset_in_orig )
+        elif hps.output_dist.lower() == 'inverse-gamma':
+            masked_output_alpha = entry_stop_gradients(self.alpha, grad_binary_mask)
+            masked_output_beta = entry_stop_gradients(self.beta, grad_binary_mask)
+            print( 'Computing InverseGamma Loglikelihood' )
+            self.loglikelihood_b_t = tfd.InverseGamma( masked_output_alpha, masked_output_beta ).log_prob( self.dataset_in_orig )
+        elif hps.output_dist.lower() == 'gamma':
+            print( 'Computing Gamma Loglikelihood' )
+            masked_output_alpha = entry_stop_gradients(self.alpha, grad_binary_mask)
+            masked_output_beta = entry_stop_gradients(self.beta, grad_binary_mask)
+            self.loglikelihood_b_t = tfd.Gamma( masked_output_alpha, masked_output_beta ).log_prob( self.dataset_in_orig )
+            
+        elif hps.output_dist.lower() == 'inverse-gaussian':
+            print( 'Computing InverseGaussian Loglikelihood' )
+            masked_output_loc = entry_stop_gradients(self.output_loc, grad_binary_mask)
+            masked_output_conc = entry_stop_gradients(self.output_conc, grad_binary_mask)
+            self.loglikelihood_b_t = tfd.InverseGaussian( masked_output_loc, masked_output_conc ).log_prob( self.dataset_in_orig )
+        elif hps.output_dist.lower() == 'zi-gamma':
+            print( 'Computing Gamma Loglikelihood' )
+            masked_output_alpha = entry_stop_gradients(self.alpha, grad_binary_mask)
+            masked_output_beta = entry_stop_gradients(self.beta, grad_binary_mask)
+            masked_output_q = entry_stop_gradients(self.q, grad_binary_mask)
+            self.loglikelihood_b_t = zeroInflatedGamma( masked_output_alpha, masked_output_beta, masked_output_q, hps.s_min ).log_prob_ZIG( self.dataset_in_orig )
+            self.loglikelihood_b_t = tf.multiply(tf.cast(self.mask_notNaN, tf.float32), self.loglikelihood_b_t, name= None)
+            
+        # cost for each trial
 
         # costs for held-in samples
         self.rec_cost_heldin = - (1. / self.cv_keep_ratio) * \
                               tf.reduce_mean(self.loglikelihood_b_t * self.cv_binary_mask_batch)
 
         # cost for held-out samples
-        if hps.cv_keep_ratio < 1.0:
+        if self.cv_keep_ratio != 1.0:
             self.rec_cost_heldout = - (1. / (1. - self.cv_keep_ratio)) * \
                                   tf.reduce_mean(self.loglikelihood_b_t * (1. - self.cv_binary_mask_batch))
         else:
@@ -703,11 +924,26 @@ class LFADS(object):
                             'l2_con',
                             'l2_ic_enc',
                             'l2_ci_enc',
+                            'l2_gen_2_factors',
+                            'l2_ci_enc_2_co_in',
                             ]
 
         l2_reg_scales = [hps.l2_gen_scale, hps.l2_con_scale,
                          hps.l2_ic_enc_scale, hps.l2_ci_enc_scale,
                          ]
+
+        # handle adding l2 costs for feedforward network if used 
+        if hps.output_dist.lower() == 'inverse-gamma' and hps.fac_2_rates_transform.lower() == 'feedforward':            
+            l2_reg_var_lists.append( 'l2_fac_2_rates' )
+            l2_reg_scales.append( hps.l2_fac_2_rates_scale )
+        if hps.output_dist.lower() == 'gamma' and hps.fac_2_rates_transform.lower() == 'feedforward':            
+            l2_reg_var_lists.append( 'l2_fac_2_rates' )
+            l2_reg_scales.append( hps.l2_fac_2_rates_scale )
+
+        if hps.output_dist.lower() == 'zi-gamma' and hps.fac_2_rates_transform.lower() == 'feedforward':            
+            l2_reg_var_lists.append( 'l2_fac_2_rates' )
+            l2_reg_scales.append( hps.l2_fac_2_rates_scale )
+            
         for l2_reg, l2_scale in zip(l2_reg_var_lists, l2_reg_scales):
             if l2_scale == 0:
                 continue
@@ -719,6 +955,16 @@ class LFADS(object):
                 l2_numels.append(numel_f)
                 v_l2 = tf.reduce_sum(v*v)
                 l2_costs.append(0.5 * l2_scale * v_l2)
+
+        # add cost to penalize distance between trainable gamma scale and HP gamma_prior
+        if hps.fac_2_rates_transform.lower() == 'linscaledsigmoid':
+            additional_l2_reg_vars = tf.get_collection('l2_scaled_sigmoid')
+            for v in additional_l2_reg_vars:
+                numel = tf.reduce_prod(tf.concat(axis=0, values=tf.shape(v)))
+                numel_f = tf.cast(numel, tf.float32)
+                l2_numels.append(numel_f)
+                v_l2 = tf.reduce_sum((v-self.gamma_prior)*(v-self.gamma_prior))
+                l2_costs.append(0.5 * hps.l2_gamma_distance_scale * v_l2)
 
         if l2_numels:
             self.l2_cost = tf.add_n(l2_costs) / tf.add_n(l2_numels)
@@ -788,12 +1034,88 @@ class LFADS(object):
         session = tf.get_default_session()
         self.logfile = os.path.join(hps.lfads_save_dir, "lfads_log")
         self.writer = tf.summary.FileWriter(self.logfile, session.graph)
+    def apply_temporal_shift( self, hps, kind_dict ):
+        """
+        Shifts channels randomly in the temporal dimension.  This is useful to
+        help the LFADS system avoid overfitting to individual spikes or fast
+        oscillations found in the data that are irrelevant to behavior. A
+        pure 'tabula rasa' approach would avoid this, but LFADS is sensitive
+        enough to pick up dynamics that you may not want.
 
+        Args:
+        data_orig_bxtxd: numpy array of continuous data where each channel is 
+        shifted randomly by t_shift. Data has margins that need to be 
+        trimmed before passing data back for "noisy input'
+        Returns:
+        data_shift_bxtxd, a numpy array with the trimmed temporal dimension after
+        applying temporal shift operation to channels and trimming margins
+        data_trim_bxtxd, a numpy array with the trimmed temporal dimension after
+        after removing margins added for temporal shift.
+        """
+        # create logical of whether to shift or not based on training/inference
+        # LW: modification to allow for turning temporal shift on/off during posterior sampling
+        # TODO: can change this afterwards to do_shift_train that is purely based on run_type since we have the conditional 
+        # outside of the function in the graph
+        do_shift = tf.logical_or( tf.equal( self.run_type, tf.constant(kind_dict("train")) ),
+                                  tf.constant( hps.apply_temporal_shift_during_posterior_sampling ) )
+        #do_shift_input = tf.logical_and( tf.equal( self.run_type, tf.constant(kind_dict("posterior_sample_and_average")) ),
+                                #   tf.constant( hps.apply_temporal_shift_during_posterior_sampling ) )                    
+        # get temporal shift value
+        t_shift = hps['temporal_shift']
         
+        # adjust and update sequence length       
+        old_seq_len = hps.num_steps
+        seq_len = old_seq_len - 2*t_shift
+        hps['num_steps'] = seq_len        
+        
+        
+        print( 'Applying temporal shift of %i samples to data channels.' % t_shift )
+        
+
+        # grab original data
+        data_orig_bxtxd = self.dataset_in_orig
+                
+
+        # trim the margins to generate the orig data
+        data_trim_bxtxd = data_orig_bxtxd[:,t_shift:-t_shift,:]
+        
+        _, T, D = data_orig_bxtxd.get_shape().as_list()
+        
+        # if temporal shift dist not defined, then use normal dist
+        if 'temporal_shift_dist' not in hps:
+            hps['temporal_shift_dist'] = 'normal'
+        print( 'Using %s distribution to generate shifts for data channels.' % hps.temporal_shift_dist )
+        # generate random integer vector of for batch of b trials with dim d to shift each channel
+        
+        if hps.temporal_shift_dist == 'normal':
+            # LW: using a truncated normal distribution
+            input_shift = tf.cast( tf.round( tf.random.truncated_normal( [D], stddev=t_shift/2 ) ) + tf.constant( t_shift, dtype=tf.float32 ), tf.int32 )
+            recon_shift = tf.cast( tf.round( tf.random.truncated_normal( [D], stddev=t_shift/2 ) ) + tf.constant( t_shift, dtype=tf.float32 ), tf.int32 )
+        elif hps.temporal_shift_dist == 'uniform':
+            # LW: using a random uniform distribution 
+            input_shift = tf.random_uniform( [D], minval=0, maxval=2*t_shift, dtype=tf.int32 )        
+            recon_shift = tf.random_uniform( [D], minval=0, maxval=2*t_shift, dtype=tf.int32 )        
+        
+        # shift each individual channel for all trials in batch by shift amount. Each batch will have a new random shift of trials
+        input_data_shift_bxtxd = tf.stack( [ data_orig_bxtxd[:,input_shift[i]:input_shift[i]+seq_len, i] for i in range(D) ], axis=2 )
+        recon_data_shift_bxtxd = tf.stack( [ data_orig_bxtxd[:,recon_shift[i]:recon_shift[i]+seq_len, i] for i in range(D) ], axis=2 )    
+        # set shape so that T dimension is not None when passed back to the graph
+        input_data_shift_bxtxd.set_shape( [None, seq_len, D ])
+        recon_data_shift_bxtxd.set_shape( [None, seq_len, D ])
+                
+        # if training, we are shifting the reconstruction data
+        # doesn't really matter for inference, but we pass the trimmed data 
+        self.dataset_in_orig = tf.cond( do_shift, lambda: recon_data_shift_bxtxd, lambda: data_trim_bxtxd )
+        
+        # if training, posterior sampling, we choose whether or not to shift the input to the encoder at inference time
+        self.dataset_in = tf.cond( do_shift, lambda: input_data_shift_bxtxd, lambda: data_trim_bxtxd )
+            
+        return hps
+
     ## functions to interface with the outside world
     def build_feed_dict(self, train_name, data_bxtxd, cv_rand_mask=None, ext_input_bxtxi=None, run_type=None,
-                        keep_prob=None, kl_ic_weight=1.0, kl_co_weight=1.0,
-                        keep_ratio=None, cv_keep_ratio=None, kl_weight=1.0, l2_weight=1.0):
+                        keep_prob=None, ff_keep_prob=None, gamma_prior=None, kl_ic_weight=1.0, kl_co_weight=1.0,
+                        keep_ratio=None, kl_weight=1.0, l2_weight=1.0):
       """Build the feed dictionary, handles cases where there is no value defined.
 
       Args:
@@ -837,7 +1159,7 @@ class LFADS(object):
         feed_dict[self.run_type] = self.hps.kind
       else:
         feed_dict[self.run_type] = run_type
-
+          
       if keep_prob is None:
         feed_dict[self.keep_prob] = self.hps.keep_prob
       else:
@@ -847,11 +1169,16 @@ class LFADS(object):
         feed_dict[self.keep_ratio] = self.hps.keep_ratio
       else:
         feed_dict[self.keep_ratio] = keep_ratio
-
-      if cv_keep_ratio is None:
-        feed_dict[self.cv_keep_ratio] = self.hps.cv_keep_ratio
+    
+      if ff_keep_prob is None:
+        feed_dict[self.ff_keep_prob] = self.hps.ff_keep_prob
       else:
-        feed_dict[self.cv_keep_ratio] = cv_keep_ratio
+        feed_dict[self.ff_keep_prob] = ff_keep_prob
+
+      if gamma_prior is None:
+        feed_dict[self.gamma_prior] = self.hps.gamma_prior
+      else:
+        feed_dict[self.gamma_prior] = gamma_prior
 
       return feed_dict
 
@@ -888,9 +1215,10 @@ class LFADS(object):
         nexamples, ntime, data_dim = data_dict[kind_data].shape
         epoch_idxs[name] = 0
         if kind == 'valid':
-            n = self.hps.valid_batch_size
-            l = range(nexamples)
-            random_example_idxs = [list(l[i:i+n]) for i in range(0, len(l), n)]
+            # pass one large batch for validation set
+            # random_example_idxs = [np.arange(nexamples)]
+            random_example_idxs = \
+                ListOfRandomBatches(nexamples, self.hps.valid_batch_size)
         else:
             random_example_idxs = \
                 ListOfRandomBatches(nexamples, batch_size)
@@ -958,23 +1286,28 @@ class LFADS(object):
 
         if run_type == "train":
             ops_to_eval.append(self.train_op)
+            ff_keep_prob = self.hps.ff_keep_prob
             keep_prob = self.hps.keep_prob
             keep_ratio = self.hps.keep_ratio
         else:
+            ff_keep_prob = 1.0
             keep_prob = 1.0
             keep_ratio = 1.0
             
         session = tf.get_default_session()
 
         evald_ops = []
-        batch_len = []
         # iterate over all datasets
         for name, example_idxs in all_name_example_idx_pairs:
             data_dict = datasets[name]
             data_extxd = data_dict[kind_data]
+
+            if self.hps.output_dist == 'poisson' and self.hps.temporal_spike_jitter_width > 0:
+                print( 'INFO: Applying temporal spike_jitter' )
+                data_extxd = shuffle_spikes_in_time(data_extxd, self.hps.temporal_spike_jitter_width)
+                
             cv_rand_mask = data_dict[cv_mask_name]
             ext_input_bxtxi = data_dict[ext_input_kind]
-            batch_len.append(len(example_idxs))
 
             this_batch = data_extxd[example_idxs,:,:]
 
@@ -986,6 +1319,8 @@ class LFADS(object):
                                              cv_rand_mask=this_batch_cvmask,
                                              ext_input_bxtxi=ext_input_batch,
                                              keep_prob=keep_prob,
+                                             ff_keep_prob=ff_keep_prob,
+                                             gamma_prior=self.hps.gamma_prior,
                                              run_type = kind_dict("train"),
                                              kl_ic_weight = kl_ic_weight,
                                              kl_co_weight = kl_co_weight,
@@ -998,10 +1333,30 @@ class LFADS(object):
                 tc, rc, rc_v, kl, l2, gn, _= evald_ops_this_batch
                 evald_ops_this_batch = (tc, rc, rc_v, kl, l2, gn)
             evald_ops.append(evald_ops_this_batch)
-        evald_ops = np.average(evald_ops, axis=0, weights=batch_len) 
-        print(batch_len)
+        evald_ops = np.mean(evald_ops, axis=0)
         return evald_ops
         
+    # MRK the following functions are not used at all
+    # def train_batch(self, dict_from_py):
+    #     session = tf.get_default_session()
+    #     ops_to_eval = [self.train_op, self.total_cost, self.rec_cost_train, \
+    #                          self.kl_cost, self.output_dist_params, self.learning_rate]
+    #     feed_dict = {self.dataset_in: dict_from_py['dataset_in'],
+    #                  self.keep_prob: dict_from_py['keep_prob'],
+    #                  self.keep_ratio: dict_from_py['keep_ratio'],
+    #                  self.run_type: kind_dict("train")}
+    #     return session.run(ops_to_eval, feed_dict)
+    #
+    #
+    # def validation_batch(self, dict_from_py):
+    #     session = tf.get_default_session()
+    #     ops_to_eval = [self.total_cost, self.rec_cost_train, self.kl_cost]
+    #     feed_dict = {self.input_data: dict_from_py['input_data'],
+    #                  self.keep_prob: 1.0, # don't need to lower keep_prob from validation
+    #                  self.keep_ratio: 1.0,
+    #                  self.run_type: kind_dict("train")}
+    #     return session.run(ops_to_eval, feed_dict)
+
 
     def run_learning_rate_decay_opt(self):
     # decay the learning rate 
@@ -1034,10 +1389,6 @@ class LFADS(object):
         session = tf.get_default_session()
 
         hps = self.hps
-
-        if hps.do_reset_learning_rate:
-            print('Learning rate has been reset to {}'.format(hps.learning_rate_init))
-            session.run(self.learning_rate.initializer)
 
         # check if target_num_epochs has been specified
         if 'target_num_epochs' in hps and hps['target_num_epochs'] > 0:
@@ -1077,6 +1428,7 @@ class LFADS(object):
                kl_weight))
 
         # pre-load the lve checkpoint (used in case of loaded checkpoint)
+
         if target_num_epochs is not None and hps['checkpoint_pb_load_name'] == 'checkpoint_lve':
             self.lve = valid_set_heldin_samp_cost
         else:
@@ -1089,12 +1441,13 @@ class LFADS(object):
         # calculate R^2 if true data is available
         name = datasets.keys()[0]
         data_dict = datasets[name]
-        do_r2_calc = (data_dict['train_truth'] is not None) and hps['do_calc_r2']
+        do_r2_calc = data_dict['train_truth'] is not None and hps['do_calc_r2']
 
         lr = self.get_learning_rate()
         self.printlog('Starting learning rate: ', lr)
         while True:
             new_lr = self.get_learning_rate()
+            #self.printlog('Starting learning rate: ', new_lr)
             # should we stop?
             if target_num_epochs is None:
                 if new_lr < hps['learning_rate_stop']:
@@ -1116,7 +1469,7 @@ class LFADS(object):
             # MRK, get the KL and L2 ramp weights
             # changed this to work based on Epochs (not steps)
             kl_weight, l2_weight = self.get_kl_l2_weights(nepoch)
-
+            
             # CP/MRK: we no longer use these step-specific outputs
             # MRK, reverted the above, don't evaluate separately on training data (unless for testing) to save time
             # training cost is not used for anything that can affect the training
@@ -1134,7 +1487,6 @@ class LFADS(object):
             #                     dataset_type="train",
             #                     kl_weight=kl_weight,
             #                     l2_weight=l2_weight)
-
             val_total_cost, valid_set_heldin_samp_cost, valid_set_heldout_samp_cost, val_kl_cost, l2_cost,_ = \
                 self.do_validation(datasets,
                                  kl_ic_weight = hps['kl_ic_weight'],
@@ -1145,7 +1497,8 @@ class LFADS(object):
 
             epoch_time = time.time() - start_time
             self.printlog("Elapsed time: %.2f" % epoch_time)
-
+            #self.printlog("DEBUG: %.4f" % tr_total_cost)
+            #self.printlog("DEBUG: %.4f" % val_total_cost)
             if np.isnan(tr_total_cost) or np.isnan(val_total_cost):
                 self.printlog('Nan found in training or validation cost evaluation. Training stopped!')
                 self.trial_recon_cost = np.nan
@@ -1211,6 +1564,8 @@ class LFADS(object):
                 lve_epoch = nepoch
                 checkpoint_path = os.path.join(self.hps.lfads_save_dir,
                                                self.hps.checkpoint_name + '_lve.ckpt')
+                # MRK, for convenience, it can be reconstructed from the paths in hps
+                #self.lve_checkpoint = checkpoint_path
 
                 self.lve_saver.save(session, checkpoint_path,
                                     global_step=self.train_step,
@@ -1266,7 +1621,12 @@ class LFADS(object):
             n_lr = hps['learning_rate_n_to_compare']
 
             # MRK, change the LR decay based on valid cost (previously was based on train cost)
+            #valid_cost_to_use = val_total_cost
+            # use training cost for learning rate annealing
             valid_cost_to_use = val_total_cost
+            #if n_lr > 0 and len(valid_costs) > n_lr and (valid_cost_to_use > max(valid_costs[-n_lr:])):
+            #    self.printlog("Decreasing learning rate")
+            #    self.run_learning_rate_decay_opt()
 
             # MRK, only decrease the LR/early stop if we are done ramping the weights
             if kl_weight == 1. and l2_weight == 1.:
@@ -1275,6 +1635,7 @@ class LFADS(object):
                     lr = session.run( self.learning_rate )
                     self.printlog("Decreasing learning rate to ", lr)
                     valid_costs.append(np.inf)
+
                 nepoch_cnt += 1
 
                 # early stopping when no improvement of validation cost
@@ -1310,6 +1671,9 @@ class LFADS(object):
             enabled), the state of the generator, the factors, and the rates.
         """
         session = tf.get_default_session()
+        
+        special_output_dists = [ 'gamma', 'inverse-gamma', 'inverse-gaussian', 'log-normal', 'zi-gamma' ]
+        
         # kl_ic_weight and kl_co_weight do not matter for posterior sample and average
         if do_average_batch:
             run_type = kind_dict('posterior_mean')
@@ -1318,13 +1682,14 @@ class LFADS(object):
 
         # Non-temporal signals will be batch x dim.
         # Temporal signals are list length T with elements batch x dim.
-        tf_vals = [self.gen_ics, self.gen_states, self.factors,
-                   self.output_dist_params]
+        tf_vals = [self.gen_ics, self.gen_states, self.factors, self.output_dist_params]
         if self.hps.ic_dim > 0:
           tf_vals += [self.prior_zs_g0.mean, self.prior_zs_g0.logvar,
                       self.posterior_zs_g0.mean, self.posterior_zs_g0.logvar]
         if self.hps.co_dim > 0:
           tf_vals.append(self.controller_outputs)
+        if self.hps.output_dist.lower() in special_output_dists:
+          tf_vals.append( self.output_rates )
 
         # MRK, run Posterior sampling on batches
         l = list(range(data_bxtxd.shape[0]))
@@ -1334,8 +1699,8 @@ class LFADS(object):
         for idx in batches:
             ext_inputs = ext_input_bxtxi[idx] if ext_input_bxtxi is not None else None
             feed_dict = self.build_feed_dict(data_name, data_bxtxd[idx], cv_rand_mask=np.ones_like(data_bxtxd[idx]),
-                ext_input_bxtxi=ext_inputs, run_type=run_type,
-                                         keep_prob=1.0, keep_ratio=1.0, cv_keep_ratio=1.0)
+        	    ext_input_bxtxi=ext_inputs, run_type=run_type,
+                                         keep_prob=1.0, keep_ratio=1.0)
             # flatten for sending into session.run
             np_vals_flat.append(session.run(tf_vals, feed_dict=feed_dict))
         # concatenate all the batches
@@ -1369,6 +1734,9 @@ class LFADS(object):
         """
         hps = self.hps
         batch_size = hps.batch_size
+        
+        special_output_dists = [ 'gamma', 'inverse-gamma', 'inverse-gaussian', 'log-normal', 'zi-gamma' ]
+        
         if pm_batch_size is None:
             pm_batch_size = batch_size
         E, T, D  = data_extxd.shape
@@ -1390,6 +1758,9 @@ class LFADS(object):
 
         if hps.co_dim > 0:
             controller_outputs = np.array([]) #np.zeros([E_to_process, T, hps.co_dim])
+            
+        if hps.output_dist.lower() in special_output_dists:
+            output_rates = np.array([])
 
         #costs = np.zeros(E_to_process)
         #nll_bound_vaes = np.zeros(E_to_process)
@@ -1413,6 +1784,7 @@ class LFADS(object):
             model_values = {}
             # compile a list of variables "vars"
             vars = ['gen_ics', 'gen_states', 'factors', 'output_dist_params']
+
             if self.hps.ic_dim > 0:
                 vars.append('prior_g0_mean')
                 vars.append('prior_g0_logvar')
@@ -1420,6 +1792,8 @@ class LFADS(object):
                 vars.append('post_g0_logvar')
             if self.hps.co_dim > 0:
                 vars.append('controller_outputs')
+            if self.hps.output_dist.lower() in special_output_dists:
+                vars.append('output_rates')
 
             # put returned variables that were on the "vars" list into a "model_values" dict
             for idx in range( len(vars) ):
@@ -1442,6 +1816,8 @@ class LFADS(object):
                     post_g0_logvar = model_values['post_g0_logvar']
                 if self.hps.co_dim > 0:
                     controller_outputs = model_values['controller_outputs']
+                if self.hps.output_dist.lower() in special_output_dists:
+                    output_rates = model_values['output_rates']
             else:
                 gen_ics = gen_ics + model_values['gen_ics']
                 gen_states = gen_states + model_values['gen_states']
@@ -1454,7 +1830,8 @@ class LFADS(object):
                     post_g0_logvar = post_g0_logvar + model_values['post_g0_logvar']
                 if self.hps.co_dim > 0:
                     controller_outputs = controller_outputs + model_values['controller_outputs']
-
+                if self.hps.output_dist.lower() in special_output_dists:
+                    output_rates = output_rates + model_values['output_rates']                                    
         self.printlog("")
         model_runs = {}
         model_runs['gen_ics'] = gen_ics
@@ -1469,7 +1846,9 @@ class LFADS(object):
 
         if self.hps.co_dim > 0:
             model_runs['controller_outputs'] = controller_outputs
-                                                   
+        if self.hps.output_dist.lower() in special_output_dists:
+            model_runs['output_rates'] = output_rates + model_values['output_rates']                                    
+
         # return the dict
         return model_runs
 
@@ -1581,7 +1960,7 @@ class LFADS(object):
 
         return all_model_runs
 
-
+            
     def eval_model_parameters(self, use_nested=True, include_strs=None):
         """Evaluate and return all of the TF variables in the model.
 

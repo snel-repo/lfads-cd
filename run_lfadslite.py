@@ -29,6 +29,10 @@ L2_GEN_SCALE = 2000.0
 L2_CON_SCALE = 0.0
 L2_IC_ENC_SCALE = 0.0
 L2_CI_ENC_SCALE = 0.0
+L2_GEN_2_FACTORS_SCALE = 0.0
+L2_CI_ENC_2_CO_IN = 0.0
+# inverse-gamma parameter: if using feedforward network, add L2 regularization
+L2_FAC_2_RATES_SCALE = 0.0
 
 IC_DIM = 64
 FACTORS_DIM = 50
@@ -36,6 +40,7 @@ IC_ENC_DIM = 128
 IC_ENC_SEG_LEN = 0 # default, non-causal modeling
 GEN_DIM = 200
 BATCH_SIZE = 128
+VALID_BATCH_SIZE = 128
 LEARNING_RATE_INIT = 0.01
 LEARNING_RATE_DECAY_FACTOR = 0.95
 LEARNING_RATE_STOP = 0.00001
@@ -44,12 +49,27 @@ N_EPOCHS_EARLY_STOP = 200 # epochs
 TARGET_NUM_EPOCHS = 0
 DO_RESET_LEARNING_RATE = False
 
+# temporal spike jitter width
+TEMPORAL_SPIKE_JITTER_WIDTH = 0
+
+# log transform input
+LOG_TRANSFORM_INPUT = False
+
+# temporal shift
+TEMPORAL_SHIFT = 0
+TEMPORAL_SHIFT_DIST = "normal"
+APPLY_TEMPORAL_SHIFT_DURING_POSTERIOR_SAMPLING = False
+
 # flag to only allow training of the encoder (i.e., lock the generator, factors readout, rates readout, controller, etc weights)
 DO_TRAIN_ENCODER_ONLY = False
 
 # flag to allow training the readin (alignment) matrices (only used in cases where alignment matrices are used
 DO_TRAIN_READIN = True
 
+# lfadslite parameter - sets the dimensionality between ci_enc and controller
+CON_CI_ENC_IN_DIM = 10
+# lfadslite parameter - sets the dimensionality between factors and controller
+CON_FAC_IN_DIM = 10
 # lfadslite param -
 #     sets whether there is an "input_factors" layer (for multi-session data, or even if you want to reduce the dimensionality of a single session)
 IN_FACTORS_DIM = 0
@@ -59,6 +79,15 @@ IN_FACTORS_DIM = 0
 MAX_GRAD_NORM = 200.0
 CELL_CLIP_VALUE = 5.0
 KEEP_PROB = 0.95
+# inverse gamma parameter: to determine whethere to use feedforward network output or linear-exponential
+FAC_2_RATES_TRANSFORM = 'linexp'
+# inverse-gamma parameter: If using feedforward network, set keep_prob ratio for dropout
+FF_KEEP_PROB = 0.95
+# zi-gamma parameters
+GAMMA_PRIOR = 20.0
+L2_GAMMA_DISTANCE_SCALE = 1e-4
+S_MIN = 0.1
+
 KEEP_RATIO = 1.0
 CD_GRAD_PASSTHRU_PROB = 0.0
 
@@ -101,6 +130,7 @@ ADAM_EPSILON = 1e-8
 ADAM_BETA1 = 0.9
 ADAM_BETA2 = 0.999
 
+
 # calculate R^2 if the truth rates are available
 DO_CALC_R2 = False
 
@@ -111,6 +141,8 @@ flags.DEFINE_string("kind", "train",
                     prior_sample, write_model_params}")
 flags.DEFINE_string("output_dist", OUTPUT_DIST,
                     "Type of output distribution, 'poisson' or 'gaussian'")
+flags.DEFINE_string("fac_2_rates_transform", FAC_2_RATES_TRANSFORM,
+                    "Type of transformation from factors to rates. 'linexp' or 'feedforward'")
 flags.DEFINE_boolean("allow_gpu_growth", True,
                      "If true, only allocate amount of memory needed for \
                      Session. Otherwise, use full GPU memory.")
@@ -169,6 +201,11 @@ flags.DEFINE_integer("ic_enc_seg_len", IC_ENC_SEG_LEN,
                      "Segment length passed to IC encoder for causal modeling")
 
 
+flags.DEFINE_integer("con_ci_enc_in_dim", CON_CI_ENC_IN_DIM,
+                     "Dimensionality of (time-varying) input to the controller that comes from the controller input encoder (ci_enc)")
+flags.DEFINE_integer("con_fac_in_dim", CON_FAC_IN_DIM,
+                     "Dimensionality of (time-varying) input to the controller that comes from the factors")
+
 # Controlling the size of the generator is one way to control complexity of
 # the dynamics (there is also l2, which will squeeze out unnecessary
 # dynamics also).  The modern deep learning approach is to make these cells
@@ -185,6 +222,14 @@ flags.DEFINE_float("l2_ic_enc_scale", L2_IC_ENC_SCALE,
                    "L2 regularization cost for the generator only.")
 flags.DEFINE_float("l2_ci_enc_scale", L2_CI_ENC_SCALE,
                    "L2 regularization cost for the controller only.")
+flags.DEFINE_float("l2_gen_2_factors_scale", L2_GEN_2_FACTORS_SCALE,
+                   "L2 regularization cost for the generator only.")
+flags.DEFINE_float("l2_ci_enc_2_co_in", L2_CI_ENC_2_CO_IN,
+                   "L2 regularization cost for the controller only.")
+flags.DEFINE_float("l2_fac_2_rates_scale", L2_FAC_2_RATES_SCALE,
+                   "L2 regularization cost for the factors 2 rates transform  only.")
+
+
 
 # KL DISTRIBUTIONS
 # If you don't know what you are donig here, please leave alone, the
@@ -342,6 +387,7 @@ flags.DEFINE_boolean("do_train_readin", DO_TRAIN_READIN, "Whether to train the \
 # Dropout is done on the input data, on controller inputs (from
 # encoder), on outputs from generator to factors.
 flags.DEFINE_float("keep_prob", KEEP_PROB, "Dropout keep probability.")
+flags.DEFINE_float("ff_keep_prob", FF_KEEP_PROB, "Dropout keep probability on the feedforward network between factors -> rates (if `feedforward` option is used for fac_2_rates_transform)")
 
 # COORDINATED DROPOUT
 flags.DEFINE_float("keep_ratio", KEEP_RATIO, "Coordinated Dropout input keep probability.")
@@ -353,8 +399,39 @@ flags.DEFINE_float("cv_keep_ratio", CV_KEEP_RATIO, "Cross-validation keep probab
 # CROSS-VALIDATION RANDOM SEED
 flags.DEFINE_float("cv_rand_seed", CV_RAND_SEED, "Random seed for held-out cross-validation sample mask.")
 
+# TEMPORAL SPIKE JITTER 
+# It appears that the system will happily fit spikes (blessing or
+# curse, depending).  You may not want this.  Jittering the spikes a
+# bit will help (-/+ bin size, as specified here).
+flags.DEFINE_integer("temporal_spike_jitter_width",
+                     TEMPORAL_SPIKE_JITTER_WIDTH,
+                     "Shuffle spikes around this window.")
+# LOG TRANSFORM INPUT
+flags.DEFINE_boolean("log_transform_input",
+                     LOG_TRANSFORM_INPUT,
+                    "Flag toggling whether to log transform input to the encoder")
 
 
+# TEMPORAL SHIFT
+# In the case of continous data, such as EMG, it seems LFADS will
+# over-couple channels to choose model high frequency events
+# Temporal shifting channels is an attempt to shift the data randomly
+# by n samples for each channel, thus breaking any directly correlated
+# events. This strategy thus allows us to prevent the system from 
+# modeling instantaneous correlations and instead focus on modeling
+# more robust correlations in the data. 
+flags.DEFINE_integer("temporal_shift",
+                     TEMPORAL_SHIFT,
+                     "Randomly shift input data channels by +/- n samples based on value.")
+flags.DEFINE_string("temporal_shift_dist", TEMPORAL_SHIFT_DIST,
+                    "Define dist. to randomly sample shifts for temporal shift operation. 'normal' or 'uniform'")
+flags.DEFINE_boolean("apply_temporal_shift_during_posterior_sampling",
+                     APPLY_TEMPORAL_SHIFT_DURING_POSTERIOR_SAMPLING,
+                    "Flag toggling whether to apply temporal shift during posterior sampling")
+# ZIG related parameters
+flags.DEFINE_float("gamma_prior", GAMMA_PRIOR, "prior of scaling of sigmoid nonlinearity")
+flags.DEFINE_float("l2_gamma_distance_scale", L2_GAMMA_DISTANCE_SCALE, "strength of penalty applied for deviating from gamma prior")
+flags.DEFINE_float("s_min", S_MIN, "minimal event size for ZIG model")
 # UNDERFITTING
 # If the primary task of LFADS is "filtering" of data and not
 # generation, then it is possible that the KL penalty is too strong.
@@ -382,7 +459,7 @@ flags.DEFINE_float("adam_beta1", ADAM_BETA1,
 flags.DEFINE_float("adam_beta2", ADAM_BETA2,
                    "Beta2 parameter of ADAM optimizer.")
 
-flags.DEFINE_boolean("do_calc_r2", DO_CALC_R2,
+flags.DEFINE_boolean("do_calc_r2", True,
                      "Calculate R^2 is the truth rates are available.")
 
 
@@ -494,7 +571,10 @@ def build_hyperparameter_dict(flags):
 # CP - in this model we use enumerations for the 'kind'
   #  d['kind'] = flags.kind
   d['kind'] = kind_dict(flags.kind)
+  
   d['output_dist'] = flags.output_dist
+  d['fac_2_rates_transform'] = flags.fac_2_rates_transform
+    
   d['data_dir'] = flags.data_dir
   d['lfads_save_dir'] = flags.lfads_save_dir
   d['checkpoint_pb_load_name'] = flags.checkpoint_pb_load_name
@@ -515,6 +595,8 @@ def build_hyperparameter_dict(flags):
   d['gen_dim'] = flags.gen_dim
 
   #lfadslite
+  d['con_ci_enc_in_dim'] = flags.con_ci_enc_in_dim
+  d['con_fac_in_dim'] = flags.con_fac_in_dim
   d['in_factors_dim'] = flags.in_factors_dim
 
   # KL distributions
@@ -551,19 +633,34 @@ def build_hyperparameter_dict(flags):
   # training options
   d['do_train_encoder_only']  = flags.do_train_encoder_only
   d['do_train_readin']  = flags.do_train_readin
+
+  d['log_transform_input'] = flags.log_transform_input
   
   # Overfitting
   d['keep_prob'] = flags.keep_prob
+  d['ff_keep_prob'] = flags.ff_keep_prob
+
+  
+  d['temporal_shift'] = flags.temporal_shift
+  d['temporal_shift_dist'] = flags.temporal_shift_dist
+  d['apply_temporal_shift_during_posterior_sampling'] = flags.apply_temporal_shift_during_posterior_sampling
+  d['temporal_spike_jitter_width'] = flags.temporal_spike_jitter_width
   d['keep_ratio'] = flags.keep_ratio
   d['cd_grad_passthru_prob'] = flags.cd_grad_passthru_prob
   d['cv_keep_ratio'] = flags.cv_keep_ratio
   d['cv_rand_seed'] = flags.cv_rand_seed
+  d['gamma_prior'] = flags.gamma_prior
+  d['s_min'] = flags.s_min
 
   d['l2_gen_scale'] = flags.l2_gen_scale
   d['l2_con_scale'] = flags.l2_con_scale
   d['l2_ic_enc_scale'] = flags.l2_ic_enc_scale
   d['l2_ci_enc_scale'] = flags.l2_ci_enc_scale
-
+  d['l2_gen_2_factors_scale'] = flags.l2_gen_2_factors_scale
+  d['l2_ci_enc_2_co_in'] = flags.l2_ci_enc_2_co_in
+  d['l2_fac_2_rates_scale'] = flags.l2_fac_2_rates_scale
+  d['l2_gamma_distance_scale'] = flags.l2_gamma_distance_scale
+  
   # Underfitting
   d['kl_ic_weight'] = flags.kl_ic_weight
   d['kl_co_weight'] = flags.kl_co_weight
@@ -605,6 +702,10 @@ def train(hps, datasets):
       name(string)-> data dictionary mapping (See top of lfads.py).
   """
   model = build_model(hps, datasets=datasets)
+  if hps.do_reset_learning_rate:
+    sess = tf.get_default_session()
+    sess.run(model.learning_rate.initializer)
+
   model.train_model(datasets)
 
 

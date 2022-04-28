@@ -4,11 +4,12 @@ from __future__ import print_function
 
 import numpy as np
 import tensorflow as tf
+from tensorflow_probability import distributions as tfd
 import os
 import sys
 import warnings
 import errno
-import subprocess
+import pdb
 
 def kind_dict_definition():
     # used in the graph's keep probability
@@ -44,14 +45,6 @@ def mkdir_p(path):
         else:
             raise
 
-def write_code_commit(path):
-    code_path = os.path.dirname(os.path.abspath(__file__))
-    latest_commit = subprocess.check_output(["git", "--git-dir=%s/.git" % code_path,
-                                             "--work-tree=%s" % code_path,
-                                             "show", "--name-status"]).strip()
-    with open(os.path.join(path, 'code_version.txt'), 'w') as f:
-        f.write(latest_commit)
-    return latest_commit
 
 def printer(data):
     # prints on the same line
@@ -91,7 +84,7 @@ def init_linear_transform(in_size, out_size, name=None, collections=None, mat_in
             vshape = [1, out_size]
         else:
             b_init = tf.constant_initializer(bias_init_value)
-            vshape = [1, out_size]
+            vshape = None
         b = tf.get_variable(bname, vshape,
                             initializer=b_init,
                             dtype=tf.float32)
@@ -128,6 +121,7 @@ def ListOfRandomBatches(num_trials, batch_size):
 
 class Gaussian(object):
     """Base class for Gaussian distribution classes."""
+
     @property
     def mean(self):
         return self.mean_bxn
@@ -407,13 +401,166 @@ def makeInitialState(state_dim, batch_size, name):
                                name=name + '_init_state_tiled')
     return init_state_tiled
 
+def tile_output( inputs, W, b, dropout=False, keep_prob=0.8, activation='relu' ):
+    # old code, incorrect
+    #tiled_W = tf.tile(W, [tf.shape(inputs)[0], 1])
+    #tiled_W = tf.reshape(tiled_W, [-1, W.get_shape()[0], W.get_shape()[1]])
+    
+    #tiled_b = tf.tile(b, [tf.shape(inputs)[0], 1])
+    #tiled_b = tf.reshape(tiled_b, [-1, b.get_shape()[0], b.get_shape()[1]])
+
+    print( inputs )
+    # moved dropout
+    if dropout:
+        print( 'Dropout applied' )
+        inputs = tf.nn.dropout( inputs, keep_prob )
+
+    # from tpu branch
+    tiled_W = tf.tile(tf.expand_dims(W, 0), [tf.shape(inputs)[0], 1, 1])
+    tiled_b = tf.tile(tf.expand_dims(b, 0), [tf.shape(inputs)[0], 1, 1])
+
+    if activation=='relu':
+        output = tf.nn.relu( tf.matmul(inputs, tiled_W) + tiled_b )
+    elif activation=='softplus':
+        output = tf.nn.softplus( tf.matmul(inputs, tiled_W) + tiled_b )
+    elif activation=='sigmoid':
+        output = tf.sigmoid( tf.matmul(inputs, tiled_W) + tiled_b )
+    elif activation=='scaled_sigmoid':
+        output = tf.matmul(inputs, tiled_W) + tiled_b
+        output = tf.multiply(tf.sigmoid(output), 20.0)
+        output = tf.clip_by_value(output, clip_value_min=1e-5, clip_value_max = 20.0-1e-5)
+    else:
+        output = tf.matmul(inputs, tiled_W) + tiled_b
+
+    return output
+
+def split_linear_transform_zigamma( inputs, output_size, W, b ):
+    # get size for weights related to gamma distribution and related to q for ZIG        
+    gamma_size = tf.cast(output_size*(2/3), tf.int64)
+    q_size = tf.cast(output_size*(1/3), tf.int64)
+    gamma_W, q_W = tf.split( W, [gamma_size, q_size], axis=1 )
+    gamma_b, q_b = tf.split( b, [gamma_size, q_size], axis=1 )
+    tiled_gamma_W = tf.tile(tf.expand_dims(gamma_W, 0), [tf.shape(inputs)[0], 1, 1])
+    tiled_q_W = tf.tile(tf.expand_dims(q_W, 0), [tf.shape(inputs)[0], 1, 1])
+    tiled_gamma_b = tf.tile(tf.expand_dims(gamma_b, 0), [tf.shape(inputs)[0], 1, 1])
+    tiled_q_b = tf.tile(tf.expand_dims(q_b, 0), [tf.shape(inputs)[0], 1, 1])
+    output_gamma = tf.matmul(inputs, tiled_gamma_W) + tiled_gamma_b
+    output_q = tf.matmul(inputs, tiled_q_W) + tiled_q_b
+    return output_gamma, output_q, gamma_size, q_size
+
+def trainable_scaled_sigmoid_transform( output, scaled_sigmoid_collection, output_size, scaled_sigmoid_init=20.0, trainable=True ):
+    """
+    output: 3d tf tensor, which is usually the linear readout from factors
+    scaled_sigmoid_collection: string. Name of the collection that the sigmoid scales will be assigned to
+    gamma_size: scalar. Number of output units (which is 2x number of neurons if using gamma)
+    scaled_sigmoid_init: scalar. Initial value of sigmoid scales (same for all output units)
+    trainable: Boolean. Whether to make sigmoid scales trainable
+    """
+    # ================================
+    # set initializers for gamma scale and get appropriate collection for it
+    # ================================
+    print('Doing scaled sigmoid transform in trainable_scaled_sigmoid_transform function')
+    w_collections = [tf.GraphKeys.GLOBAL_VARIABLES, scaled_sigmoid_collection]
+    # initialize sigmoid scale for each individual output units
+    sigmoid_scale_init = tf.multiply(tf.ones(shape=[1,output_size]), scaled_sigmoid_init)
+    sigmoid_scale_name = 'sigmoid_scale'
+    # get variable for sigmoid scale for all output units based on the init values we set
+    sigmoid_scale = tf.get_variable( sigmoid_scale_name, initializer=sigmoid_scale_init, trainable=trainable, dtype=tf.float32, collections=w_collections )
+    output_nl = tf.sigmoid(output)
+    # scale the sigmoid output with sigmoid scale
+    output_nl = output_nl*sigmoid_scale
+    # clip the output of sigmoid transform to avoid the outputs getting literally zero due to numerical precision
+    # clip value max is not important. Can remove but it doesn't have much effect, at all.
+    output_nl = tf.clip_by_value(output_nl, clip_value_min=1e-5, clip_value_max = sigmoid_scale-1e-5)
+    return output_nl
+
+class FeedforwardTimeVarying(object):
+    
+    def __init__(self, inputs, output_size, output_name, collections, transform_name=None, do_bias=True,normalized=False, keep_prob=1.0, zigamma=False):
+        num_timesteps = tf.shape( inputs )[1]
+        input_size = inputs.get_shape().as_list()[2]
+        outputs = []
+        self.keep_prob = keep_prob
+        # =======================
+        # get weights collections
+        # =======================
+        
+        w_collections = [tf.GraphKeys.GLOBAL_VARIABLES, "norm-variables"]
+        
+        # ===================================
+        # set initializers for weights/biases
+        # ===================================
+        
+        w_init = tf.contrib.layers.xavier_initializer()
+        b_init = tf.zeros_initializer()
+        
+        # ==============================================
+        # create weights/biases variables for all layers
+        # ==============================================
+        
+        # add weights to collections
+        w_collections += collections
+        
+        
+        # define names for all weights/biases
+        w_h1_name = 'fac_2_rates_h1/W'
+        b_h1_name = 'fac_2_rates_h1/b'
+        w_h2_name = 'fac_2_rates_h2/W'
+        b_h2_name = 'fac_2_rates_h2/b'
+        w_oL_name = 'fac_2_rates_oL/W'
+        b_oL_name = 'fac_2_rates_oL/b'
+        
+        print( 'I am a happy feedforward network that will find a nice nonlinear mapping for you :)' )
+
+        # ==============================================
+        # create weights/biases variables for all layers
+        # ==============================================
+
+        # create hidden layer I weights/biases
+        w_h1 = tf.get_variable( w_h1_name, [ input_size, input_size ], initializer=w_init, dtype=tf.float32, collections=w_collections )
+        b_h1 = tf.get_variable( b_h1_name, [ 1, input_size ], initializer=b_init, dtype=tf.float32 )
+        # create hidden layer II weights/biases
+        w_h2 = tf.get_variable( w_h2_name, [ input_size, input_size ], initializer=w_init, dtype=tf.float32, collections=w_collections )
+        b_h2 = tf.get_variable( b_h2_name, [ 1, input_size ], initializer=b_init, dtype=tf.float32 )
+        # create output layer weights/biases
+        w_oL = tf.get_variable( w_oL_name, [ input_size, output_size ], initializer=w_init, dtype=tf.float32, collections=w_collections )
+        b_oL = tf.get_variable( b_oL_name, [ 1, output_size ], initializer=b_init, dtype=tf.float32 )
+
+        # =====================================
+        # compute output of feedforward network
+        # =====================================
+        
+        output_hL1 = tile_output(inputs, w_h1, b_h1, activation='relu', dropout=True, keep_prob=self.keep_prob)
+        output_hL2 = tile_output(output_hL1, w_h2, b_h2, activation='relu', dropout=True, keep_prob=self.keep_prob)
+        # deal with ziGamma split
+        if zigamma is True:
+            # get size for weights related to gamma distribution and related to q for ZIG        
+            gamma_W_size = tf.cast(output_size*(2/3), tf.int64)
+            q_size = tf.cast(output_size*(1/3), tf.int64)
+            gamma_W, q_W = tf.split( w_oL, [gamma_W_size, q_size], axis=1 )
+            gamma_b, q_b = tf.split( b_oL, [gamma_W_size, q_size], axis=1 )
+            #output_gamma = tile_output(output_hL2, gamma_W, gamma_b, activation='softplus', dropout=False)
+            output_gamma = tile_output(output_hL2, gamma_W, gamma_b, activation='scaled_sigmoid', dropout=False)
+            output_q = tile_output(output_hL2, q_W, q_b, activation='sigmoid', dropout=False)
+            # this is temporary. Do NOT un-comment
+            #output_q = tf.where(tf.math.less(output_q, 0.1), tf.math.multiply(tf.ones_like(output_q), 0.01), tf.math.multiply(tf.ones_like(output_q), 0.3))
+            output_q = tf.clip_by_value(output_q, clip_value_min=1e-5, clip_value_max=1-1e-5)
+            output = tf.concat([output_gamma, output_q], 2)
+            self.output = output
+            print('Using FFN for ZiGamma')
+        else:
+            output = tile_output(output_hL2, w_oL, b_oL, activation='softplus', dropout=False)
+            self.output = output
+
+
 
 class LinearTimeVarying(object):
-    # self.output = linear transform
+        # self.output = linear transform
     # self.output_nl = nonlinear transform
 
     def __init__(self, inputs, output_size, transform_name, nonlinearity=None,
-                 collections=None, W=None, b=None, normalized=False, do_bias=True):
+                 collections=None, W=None, b=None, normalized=False, do_bias=True,
+                 scaled_sigmoid_collection=None, zigamma=False):
         num_timesteps = tf.shape(inputs)[1]
         # must return "as_list" to get ints
         input_size = inputs.get_shape().as_list()[2]
@@ -432,6 +579,9 @@ class LinearTimeVarying(object):
         self.W = W
         self.b = b
 
+        if nonlinearity is 'scaled_sigmoid' and scaled_sigmoid_collection is None:
+            raise ValueError('LinearTimeVarying: must provide scaled_sigmoid_collection when using scaled_sigmoid as nonlinearity')
+
         # inputs_permuted = tf.transpose(inputs, perm=[1, 0, 2])
         # initial_outputs = tf.TensorArray(dtype=tf.float32, size=num_timesteps, name='init_linear_outputs')
         # initial_outputs_nl = tf.TensorArray(dtype=tf.float32, size=num_timesteps, name='init_nl_outputs')
@@ -443,15 +593,31 @@ class LinearTimeVarying(object):
         #tiled_b = tf.reshape(tiled_b, [-1, b.get_shape()[0], b.get_shape()[1]])
         #output = tf.matmul(inputs, tiled_W) + tiled_b
 
-        tiled_W = tf.tile(tf.expand_dims(W, 0), [tf.shape(inputs)[0], 1, 1])
-        tiled_b = tf.tile(tf.expand_dims(b, 0), [tf.shape(inputs)[0], 1, 1])
-        output = tf.matmul(inputs, tiled_W) + tiled_b
+        if zigamma is True:
+            output_gamma, output_q, gamma_size, q_size = split_linear_transform_zigamma( inputs, output_size, self.W, self.b )
+            # apply sigmoid to output_q in all cases
+            output_q_nl = tf.sigmoid(output_q)
+            output_q_nl = tf.clip_by_value(output_q_nl, clip_value_min=1e-5, clip_value_max=1-1e-5)
+            if nonlinearity is 'exp':
+                output_gamma_nl = tf.exp(output_gamma)
+                self.output_nl = tf.concat([output_gamma_nl, output_q_nl], 2)
+            elif nonlinearity is 'scaled_sigmoid':
+                output_gamma_nl = trainable_scaled_sigmoid_transform(output_gamma, scaled_sigmoid_collection, gamma_size, scaled_sigmoid_init=20.0, trainable=True)
+                self.output_nl = tf.concat([output_gamma_nl, output_q_nl], 2)
+            self.output = tf.concat([output_gamma, output_q_nl], 2)
+        else:            
+            tiled_W = tf.tile(tf.expand_dims(W, 0), [tf.shape(inputs)[0], 1, 1])
+            tiled_b = tf.tile(tf.expand_dims(b, 0), [tf.shape(inputs)[0], 1, 1])
+            output = tf.matmul(inputs, tiled_W) + tiled_b
 
-        if nonlinearity is 'exp':
-            output_nl = tf.exp(output)
-            self.output_nl = output_nl
-        #print('NEW TIMEVARYING USED')
-        self.output = output
+            if nonlinearity is 'exp':
+                output_nl = tf.exp(output)
+                self.output_nl = output_nl
+            elif nonlinearity is 'scaled_sigmoid':
+                scaled_sigmoid_init=20.0 # can make this a HP
+                output_nl = trainable_scaled_sigmoid_transform(output, scaled_sigmoid_collection, output_size, scaled_sigmoid_init=scaled_sigmoid_init, trainable=True) 
+                self.output_nl = output_nl
+            self.output = output
 
 class LinearTimeVarying_OLD(object):
     # self.output = linear transform
@@ -567,6 +733,7 @@ class KLCost_GaussianGaussian(object):
             - 1.0, [1])
 
         self.kl_cost_b = tf.reduce_sum(kl_b, [1]) if len(kl_b.get_shape()) == 2 else kl_b
+        self.kl_cost = tf.reduce_mean(kl_b)
 
         #self.kl_cost = tf.reduce_mean(kl_b)
 
@@ -703,3 +870,78 @@ def dropout(x, keep_prob, noise_shape=None, seed=None, name=None,
         # if context.in_graph_mode():
         ret.set_shape(x.get_shape())
         return ret, binary_tensor
+    
+def shuffle_spikes_in_time(data_bxtxd, w):
+    """Shuffle the spikes in the temporal dimension.  This is useful to
+    help the LFADS system avoid overfitting to individual spikes or fast
+    oscillations found in the data that are irrelevant to behavior. A
+    pure 'tabula rasa' approach would avoid this, but LFADS is sensitive
+    enough to pick up dynamics that you may not want.
+
+    Args:
+      data_bxtxd: numpy array of spike count data to be shuffled.
+    Returns:
+    S_bxtxd, a numpy array with the same dimensions and contents as
+      data_bxtxd, but shuffled appropriately.
+
+    """
+
+    B, T, N = data_bxtxd.shape
+    #w = self.hps.temporal_spike_jitter_width
+
+    if w == 0:
+        return data_bxtxd
+
+    max_counts = int( np.max(data_bxtxd) )
+    S_bxtxd = np.zeros([B,T,N])
+
+    # Intuitively, shuffle spike occurances, 0 or 1, but since we have counts,
+    # Do it over and over again up to the max count.
+    for mc in range(1,max_counts+1):
+        idxs = np.nonzero(data_bxtxd >= mc)
+
+        data_ones = np.zeros_like(data_bxtxd)
+        data_ones[data_bxtxd >= mc] = 1
+
+        nfound = len(idxs[0])
+        shuffles_incrs_in_time = np.random.randint(-w, w, size=nfound)
+
+        shuffle_tidxs = idxs[1].copy()
+        shuffle_tidxs += shuffles_incrs_in_time
+
+        # Reflect on the boundaries to not lose mass.
+        shuffle_tidxs[shuffle_tidxs < 0] = -shuffle_tidxs[shuffle_tidxs < 0]
+        shuffle_tidxs[shuffle_tidxs > T-1] = \
+                                             (T-1)-(shuffle_tidxs[shuffle_tidxs > T-1] -(T-1))
+
+        for iii in zip(idxs[0], shuffle_tidxs, idxs[2]):
+            S_bxtxd[iii] += 1
+
+    return S_bxtxd
+
+
+class zeroInflatedGamma(object):
+        # self.output = linear transform
+    # self.output_nl = nonlinear transform
+
+    def __init__(self, alpha, beta, q, s_min):
+        num_timesteps = tf.shape(alpha)[1]
+        # must return "as_list" to get ints
+        #input_size = alpha.get_shape().as_list()[2]
+        self.alpha = alpha
+        self.beta = beta
+        self.q = q
+        #self.s_min = 0.1 # or 0.0307-5e-5 for inequal or (0.1/3)-1e-5 for equal interval sparse sampl
+        self.s_min = s_min
+
+    def log_prob_ZIG(self, x):
+        # give where spike = 0 a value of 1, to be able to use log_prob gamma.
+        # give where spike is not 0 a value of x-s_min
+        adjust_x = tf.where(tf.math.equal(x, 0.0), tf.ones_like(x), x-self.s_min)
+        # compute log-likelihood element-wise. Where spike=0 now has a inaccurate value
+        loglikelihood_adj_gamma = tfd.Gamma( self.alpha, self.beta ).log_prob( adjust_x )
+        # now convert those inaccurate value to be log(1-q)
+        # add log(q) to places where x>s_min
+        self.loglikelihood = tf.where(tf.math.equal(x, 0.0), tf.math.log(1-self.q), loglikelihood_adj_gamma+tf.math.log(self.q))
+        return self.loglikelihood
+    

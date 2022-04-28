@@ -4,7 +4,7 @@ import json
 
 import numpy as np
 import tensorflow as tf
-
+import pdb
 
 
 def load_datasets(data_dir, data_filename_stem, hps):
@@ -27,7 +27,7 @@ def load_datasets(data_dir, data_filename_stem, hps):
     datasets: a dataset dictionary, with one name->data dictionary pair for
     each dataset file.
   """
-  print("Reading data from ", data_dir)
+  print("Reading data from " + data_dir)
   datasets = read_datasets(data_dir, data_filename_stem)
   for k, data_dict in datasets.items():
     train_total_size = len(data_dict['train_data'])
